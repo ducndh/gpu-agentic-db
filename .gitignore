@@ -1,0 +1,10 @@
+models/
+data/
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+.DS_Store
+results/*.json
+!results/.gitkeep
