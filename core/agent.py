@@ -1,25 +1,28 @@
 """
-ReAct (Reason + Act) agent loop with per-stage timing instrumentation.
+ReAct (Reason + Act) agent loop with per-stage timing and retry-until-correct.
 
 The agent follows the standard ReAct pattern:
   Thought → Action (SQL) → Observation (result) → Thought → ... → Answer
 
-Each turn is a complete Thought+Action+Observation cycle. We time every
-stage precisely so we can compute the colocation ceiling.
+For each task, if a validation_key is provided, the agent's final answer is
+checked against it.  If incorrect, the agent is retried with a hint
+("Your previous answer was incorrect..."), up to max_retries times.
+
+This mimics a real agentic workflow where the system keeps trying until it
+produces a correct answer, not just until it stops generating.
 
 Stage timing per turn:
-  llm_gen     - LLM generates Thought + SQL action (decode)
-  llm_prefill - LLM processes context with SQL result (prefill, estimated)
-  sql_exec    - DB executes the SQL
-  fetch       - fetchall() copies results to Python
-  serialize   - Format result table as markdown (CPU work)
-  tokenize    - Tokenize the formatted text (CPU work)
+  sql_exec    - DB executes the SQL (includes GPU compute for Sirius)
+  fetch       - fetchall() copies results to Python (only non-zero for CPU backend)
+  serialize   - Format result table as markdown (CPU string work)
+  tokenize    - Tokenize the formatted text (CPU tokenizer)
+  llm_prefill - LLM processes context with SQL result (estimated from usage)
+  llm_gen     - LLM generating SQL / reasoning / final answer (decode)
 
-The data path = fetch + serialize + tokenize is what GPU colocation removes.
+data_path = fetch + serialize + tokenize = what GPU colocation would eliminate.
 """
 
 import re
-import time
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -33,27 +36,35 @@ from core.timer import RunRecord, StageTimer, TurnRecord
 
 SYSTEM_PROMPT_TEMPLATE = """\
 You are a data analyst assistant with access to a SQL database.
-To answer the user's question, you can run SQL queries using this format:
+To answer the user's question, run SQL queries using this format:
 
 Action: SQL
 ```sql
 SELECT ...
 ```
 
-After seeing the query result (Observation), continue reasoning until you
-have a final answer. When done, write:
+After seeing the result (Observation), continue reasoning until done.
+When you have a final answer, write:
 
 Answer: <your final answer here>
 
 Rules:
-- Write exactly one SQL block per Action, then stop and wait for the result.
-- The SQL must be valid DuckDB SQL.
-- Do NOT use EXPLAIN or any DDL (CREATE, INSERT, DROP).
+- One SQL block per Action, then stop and wait for the result.
+- Use valid DuckDB SQL. No EXPLAIN, CREATE, INSERT, or DROP.
 - Keep SQL concise; avoid SELECT * on large tables.
-- If the result is empty or unexpected, try a different approach.
-- Limit large scans to at most 1000 rows unless the user asks otherwise.
+- Limit large scans to at most 1000 rows unless asked otherwise.
+- If results are empty or unexpected, try a different approach.
 
 {schema}
+"""
+
+RETRY_PROMPT = """\
+Your previous answer was not quite right. Here is the question again:
+
+{question}
+
+Please try again carefully. Make sure your final Answer: line contains
+the specific value asked for (a number, name, or brief result).
 """
 
 # ── Result formatting ─────────────────────────────────────────────────────────
@@ -62,7 +73,7 @@ def format_result_as_markdown(columns: list[str], rows: list[tuple]) -> str:
     """Convert query result to a markdown table string."""
     if not rows:
         return "(empty result)"
-    MAX_ROWS = 100  # truncate very large results to keep context manageable
+    MAX_ROWS = 100  # truncate to keep context manageable
     lines = []
     lines.append("| " + " | ".join(str(c) for c in columns) + " |")
     lines.append("|" + "|".join(" --- " for _ in columns) + "|")
@@ -73,20 +84,18 @@ def format_result_as_markdown(columns: list[str], rows: list[tuple]) -> str:
     return "\n".join(lines)
 
 
-# ── SQL extraction ────────────────────────────────────────────────────────────
+# ── SQL / answer extraction ───────────────────────────────────────────────────
 
 _SQL_BLOCK = re.compile(r"```sql\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
-_ANSWER = re.compile(r"^Answer\s*:\s*(.+)", re.MULTILINE | re.DOTALL)
+_ANSWER    = re.compile(r"^Answer\s*:\s*(.+)", re.MULTILINE | re.DOTALL)
 
 
 def extract_sql(text: str) -> Optional[str]:
-    """Extract SQL from a markdown code block in the LLM output."""
     m = _SQL_BLOCK.search(text)
     return m.group(1).strip() if m else None
 
 
 def extract_answer(text: str) -> Optional[str]:
-    """Extract the final answer if the LLM declared one."""
     m = _ANSWER.search(text)
     return m.group(1).strip() if m else None
 
@@ -95,22 +104,23 @@ def extract_answer(text: str) -> Optional[str]:
 
 class ReactAgent:
     """
-    ReAct agent with per-stage timing.
+    ReAct agent with per-stage timing and retry-until-correct.
 
     Parameters
     ----------
     llm: LlamaBackend
-        Loaded LLM backend.
+        Loaded LLM backend (call load() before using the agent).
     db: DuckDBCPUBackend | SiriusGPUBackend
         Database backend (must already be connected).
     tokenizer: Tokenizer
-        HuggingFace tokenizer (for measuring tokenization time).
+        HuggingFace tokenizer for measuring tokenization cost.
     max_turns: int
-        Maximum number of (Thought+Action+Observation) cycles before forcing
-        a fallback answer.
+        Max (Thought+Action+Observation) cycles per attempt.
     fallback_sql: str | None
-        If provided, used when the LLM generates invalid SQL (fall back
-        silently, keeps timing clean).
+        Gold SQL used when LLM generates invalid SQL.
+    max_retries: int
+        If validation_key is provided and the answer is wrong, retry
+        the full conversation this many additional times.
     """
 
     def __init__(
@@ -120,12 +130,18 @@ class ReactAgent:
         tokenizer: Tokenizer,
         max_turns: int = 5,
         fallback_sql: Optional[str] = None,
+        max_retries: int = 2,
     ):
         self.llm = llm
         self.db = db
         self.tokenizer = tokenizer
         self.max_turns = max_turns
         self.fallback_sql = fallback_sql
+        self.max_retries = max_retries
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
 
     def run(
         self,
@@ -135,9 +151,11 @@ class ReactAgent:
         backend_name: str,
         model_name: str,
         scale_factor: int,
+        validation_key: Optional[str] = None,
     ) -> RunRecord:
         """
-        Run the agent on a question and return a fully-instrumented RunRecord.
+        Run the agent (with retries if validation_key is provided).
+        All timing is accumulated in the returned RunRecord.
         """
         record = RunRecord(
             task_name=task_name,
@@ -148,47 +166,101 @@ class ReactAgent:
         )
 
         system_prompt = SYSTEM_PROMPT_TEMPLATE.format(schema=schema_hint)
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user",   "content": question},
-        ]
 
+        for attempt in range(1 + self.max_retries):
+            # Fresh conversation for each attempt
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": question},
+            ]
+
+            answer = self._run_attempt(messages, record, backend_name)
+
+            # Validate if key provided
+            if validation_key is None:
+                record.final_answer = answer or "(no answer)"
+                record.answer_correct = True  # type: ignore[attr-defined]
+                break
+
+            correct = validation_key.lower() in (answer or "").lower()
+            record.answer_correct = correct  # type: ignore[attr-defined]
+
+            if correct:
+                record.final_answer = answer or "(no answer)"
+                break
+
+            if attempt < self.max_retries:
+                # Add a retry turn
+                record.n_retries = attempt + 1  # type: ignore[attr-defined]
+                # Note: retry turns add to the total timing (realistic)
+                messages = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": RETRY_PROMPT.format(question=question)},
+                ]
+            else:
+                # Exhausted retries
+                record.final_answer = answer or "(no answer after retries)"
+
+        if not hasattr(record, "n_retries"):
+            record.n_retries = 0  # type: ignore[attr-defined]
+        if not hasattr(record, "answer_correct"):
+            record.answer_correct = False  # type: ignore[attr-defined]
+
+        return record
+
+    # ------------------------------------------------------------------
+    # Inner attempt loop
+    # ------------------------------------------------------------------
+
+    def _run_attempt(
+        self,
+        messages: list[dict],
+        record: RunRecord,
+        backend_name: str,
+    ) -> Optional[str]:
+        """
+        Run one attempt (max_turns turns).  Appends turns to record.
+        Returns the final answer string if one was produced, else None.
+        """
+        prev_prompt_tokens = 0  # tracks KV cache state across turns
         for turn_idx in range(self.max_turns):
-            turn = TurnRecord(turn_idx=turn_idx)
+            turn = TurnRecord(turn_idx=len(record.turns))
 
-            # ── LLM generates Thought + Action ────────────────────────────────
-            with StageTimer() as llm_timer:
-                llm_resp = self.llm.chat(messages)
-            # We split into prefill/decode per LlamaBackend estimates
+            # ── LLM generates Thought + Action ────────────────────────────
+            llm_resp: LLMResponse = self.llm.chat(messages,
+                                                   prev_prompt_tokens=prev_prompt_tokens)
+            # llm_prefill: full-context estimate (correct for turn 0, overestimates later)
             turn.add("llm_prefill", llm_resp.prefill_ms,
                      n_prompt_tokens=llm_resp.n_prompt_tokens)
+            # llm_prefill_incr: KV-cache-aware estimate — only new tokens each turn.
+            # This is the right denominator for multi-turn colocation ceiling.
+            turn.add("llm_prefill_incr", llm_resp.prefill_incr_ms,
+                     n_new_prompt_tokens=llm_resp.n_new_prompt_tokens)
             turn.add("llm_gen", llm_resp.decode_ms,
                      n_output_tokens=llm_resp.n_output_tokens)
+            prev_prompt_tokens = llm_resp.n_prompt_tokens
 
             assistant_text = llm_resp.text
 
-            # ── Check for final answer ─────────────────────────────────────────
+            # ── Check for final Answer ─────────────────────────────────────
             final_answer = extract_answer(assistant_text)
             if final_answer:
                 record.add_turn(turn)
-                record.final_answer = final_answer
-                break
+                return final_answer
 
-            # ── Extract SQL ────────────────────────────────────────────────────
+            # ── Extract SQL ────────────────────────────────────────────────
             sql = extract_sql(assistant_text)
             used_fallback = False
 
             if sql is None:
-                # LLM didn't produce SQL — if no fallback, end agent
                 if self.fallback_sql is None:
                     record.sql_failure_count += 1
                     record.add_turn(turn)
-                    record.final_answer = "(agent ended: no SQL generated)"
-                    break
+                    return None
                 sql = self.fallback_sql
                 used_fallback = True
 
-            # ── Execute SQL ────────────────────────────────────────────────────
+            # ── Execute SQL ────────────────────────────────────────────────
             try:
                 qr: QueryResult = self.db.execute(sql)
             except Exception as e:
@@ -197,36 +269,32 @@ class ReactAgent:
             if not qr.ok:
                 record.sql_failure_count += 1
                 if self.fallback_sql and not used_fallback:
-                    # retry with gold SQL
                     qr = self.db.execute(self.fallback_sql)
-                    used_fallback = True
 
             if qr.ok:
                 record.sql_success_count += 1
             turn.add("sql_exec", qr.exec_ms, n_rows=qr.n_rows, n_cols=qr.n_cols)
             turn.add("fetch", qr.fetch_ms, n_rows=qr.n_rows)
 
-            # ── Serialize result to markdown text ──────────────────────────────
+            # ── Serialize result ───────────────────────────────────────────
             with StageTimer() as ser_timer:
                 result_text = format_result_as_markdown(qr.columns, qr.rows)
             turn.add("serialize", ser_timer.elapsed_ms,
                      n_bytes=len(result_text.encode()))
 
-            # ── Tokenize (CPU) ─────────────────────────────────────────────────
+            # ── Tokenize (CPU) ─────────────────────────────────────────────
             with StageTimer() as tok_timer:
                 encoding = self.tokenizer.encode(result_text)
-            n_tokens = len(encoding.ids)
-            turn.add("tokenize", tok_timer.elapsed_ms, n_tokens=n_tokens)
+            turn.add("tokenize", tok_timer.elapsed_ms,
+                     n_tokens=len(encoding.ids))
 
             record.add_turn(turn)
 
-            # ── Build next message: append observation ─────────────────────────
+            # ── Append observation to conversation ─────────────────────────
             messages.append({"role": "assistant", "content": assistant_text})
-            observation = f"Observation:\n{result_text}\n\nContinue your analysis."
-            messages.append({"role": "user", "content": observation})
+            messages.append({
+                "role": "user",
+                "content": f"Observation:\n{result_text}\n\nContinue your analysis.",
+            })
 
-        else:
-            # Exceeded max_turns
-            record.final_answer = f"(agent ended: exceeded {self.max_turns} turns)"
-
-        return record
+        return None  # max_turns exceeded without an Answer

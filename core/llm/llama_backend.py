@@ -25,10 +25,12 @@ from llama_cpp import Llama
 @dataclass
 class LLMResponse:
     text: str
-    n_prompt_tokens: int
+    n_prompt_tokens: int       # Total prompt tokens (full context)
+    n_new_prompt_tokens: int   # Incremental tokens since last call (KV cache reuse)
     n_output_tokens: int
-    prefill_ms: float      # Time to process prompt (includes KV cache fill)
-    decode_ms: float       # Time to generate output tokens
+    prefill_ms: float          # Estimated from total prompt tokens (overestimates in multi-turn)
+    prefill_incr_ms: float     # Estimated from new tokens only (accurate for multi-turn)
+    decode_ms: float           # Time to generate output tokens
     total_ms: float
 
 
@@ -54,6 +56,7 @@ class LlamaBackend:
         temperature: float = 0.0,  # greedy for reproducibility
         max_tokens: int = 512,
         verbose: bool = False,
+        flash_attn: bool = True,  # Flash Attention — faster prefill, lower VRAM
     ):
         self.model_path = model_path
         self.n_ctx = n_ctx
@@ -61,6 +64,7 @@ class LlamaBackend:
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.verbose = verbose
+        self.flash_attn = flash_attn
         self._model: Optional[Llama] = None
         self._model_name = Path(model_path).stem
 
@@ -75,6 +79,7 @@ class LlamaBackend:
             n_ctx=self.n_ctx,
             n_gpu_layers=self.n_gpu_layers,
             verbose=self.verbose,
+            flash_attn=self.flash_attn,
         )
 
     def unload(self):
@@ -89,7 +94,7 @@ class LlamaBackend:
     def __exit__(self, *_):
         self.unload()
 
-    def chat(self, messages: list[dict]) -> LLMResponse:
+    def chat(self, messages: list[dict], prev_prompt_tokens: int = 0) -> LLMResponse:
         """
         Run a chat completion and return timing-annotated LLMResponse.
 
@@ -115,27 +120,38 @@ class LlamaBackend:
         n_output = usage.get("completion_tokens", 0)
         text = output["choices"][0]["message"]["content"]
 
+        # Incremental prompt tokens: only the new tokens since last call.
+        # In multi-turn with KV cache, llama-cpp reuses cached tokens, so
+        # actual prefill work ≈ new tokens only, not full context.
+        n_new_prompt = max(0, n_prompt - prev_prompt_tokens)
+
         # Estimate prefill vs decode split.
         # llama-cpp doesn't expose separate prefill/decode time directly, but
-        # we can estimate: prefill speed is ~3-5x decode speed for GPU inference.
-        # Prefill ≈ n_prompt / (n_prompt + n_output * RATIO) * total_ms
+        # prefill speed is ~3-5x decode speed for GPU inference.
         # We use RATIO=4 (empirical for GPU inference).
         PREFILL_RELATIVE_SPEED = 4.0
-        if n_prompt + n_output > 0:
-            prefill_weight = n_prompt / PREFILL_RELATIVE_SPEED
-            decode_weight = n_output
-            total_weight = prefill_weight + decode_weight
-            prefill_ms = total_ms * (prefill_weight / total_weight) if total_weight > 0 else 0
-            decode_ms = total_ms - prefill_ms
-        else:
-            prefill_ms = 0.0
-            decode_ms = total_ms
+
+        def _split(prompt_toks: int) -> tuple[float, float]:
+            if prompt_toks + n_output <= 0:
+                return 0.0, total_ms
+            pw = prompt_toks / PREFILL_RELATIVE_SPEED
+            dw = n_output
+            tw = pw + dw
+            p = total_ms * (pw / tw)
+            return p, total_ms - p
+
+        # Full-context estimate (used for turn 1 / single-turn analysis)
+        prefill_ms, decode_ms = _split(n_prompt)
+        # Incremental estimate (accurate for multi-turn with KV cache)
+        prefill_incr_ms, _ = _split(n_new_prompt)
 
         return LLMResponse(
             text=text,
             n_prompt_tokens=n_prompt,
+            n_new_prompt_tokens=n_new_prompt,
             n_output_tokens=n_output,
             prefill_ms=prefill_ms,
+            prefill_incr_ms=prefill_incr_ms,
             decode_ms=decode_ms,
             total_ms=total_ms,
         )

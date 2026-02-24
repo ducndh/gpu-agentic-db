@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 DATA_PATH_STAGES = ("fetch", "serialize", "tokenize")
-ALL_STAGES = ("sql_exec", "fetch", "serialize", "tokenize", "llm_prefill", "llm_gen")
+ALL_STAGES = ("sql_exec", "fetch", "serialize", "tokenize", "llm_prefill", "llm_prefill_incr", "llm_gen")
 
 
 @dataclass
@@ -88,6 +88,23 @@ class RunRecord:
         ceiling = self.colocation_ceiling_ms()
         return (self.total_ms() / ceiling) if ceiling > 0 else 1.0
 
+    def total_incremental_llm_ms(self) -> float:
+        """LLM cost using KV-cache-aware incremental prefill + decode across all turns."""
+        return sum(
+            r.duration_ms for t in self.turns for r in t.records
+            if r.stage in ("llm_prefill_incr", "llm_gen")
+        )
+
+    def incr_colocation_ceiling_ms(self) -> float:
+        """Per-turn ceiling: total - data_path, with incremental LLM as denominator.
+        Represents the fraction of per-turn work colocation can eliminate."""
+        return self.total_incremental_llm_ms() + (self.total_ms() - self.total_incremental_llm_ms() - self.total_data_path_ms())
+
+    def incr_data_path_pct(self) -> float:
+        """data_path as % of (data_path + incremental LLM) — the true per-turn ratio."""
+        denom = self.total_data_path_ms() + self.total_incremental_llm_ms()
+        return (self.total_data_path_ms() / denom * 100) if denom > 0 else 0.0
+
     def stage_breakdown(self) -> dict[str, float]:
         """Total ms per stage across all turns."""
         breakdown: dict[str, float] = {s: 0.0 for s in ALL_STAGES}
@@ -99,7 +116,8 @@ class RunRecord:
 
     def to_dict(self) -> dict:
         breakdown = self.stage_breakdown()
-        return {
+        incr_llm = self.total_incremental_llm_ms()
+        d = {
             "task": self.task_name,
             "backend": self.backend,
             "model": self.model_name,
@@ -113,9 +131,17 @@ class RunRecord:
             "data_path_pct": round(self.data_path_pct(), 1),
             "colocation_ceiling_ms": round(self.colocation_ceiling_ms(), 2),
             "colocation_speedup": round(self.colocation_speedup(), 3),
+            "incr_llm_ms": round(incr_llm, 2),
+            "incr_data_path_pct": round(self.incr_data_path_pct(), 1),
             "stage_breakdown_ms": {k: round(v, 2) for k, v in breakdown.items()},
             "final_answer": self.final_answer,
         }
+        # Optional fields set by ReactAgent
+        if hasattr(self, "answer_correct"):
+            d["answer_correct"] = self.answer_correct  # type: ignore[attr-defined]
+        if hasattr(self, "n_retries"):
+            d["n_retries"] = self.n_retries  # type: ignore[attr-defined]
+        return d
 
 
 class StageTimer:

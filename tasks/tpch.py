@@ -25,6 +25,11 @@ class Task:
     gold_sql: str
     expected_result_tier: str   # "small" | "medium" | "large"
     n_sql_steps: int             # expected number of SQL calls
+    # validation_key: a string that MUST appear in the agent's final answer
+    # to count as correct (case-insensitive). None = no validation.
+    # For numeric tasks: the expected value as a string (e.g. "12345.67").
+    # For multi-row: a distinctive value from the first result row.
+    validation_key: str | None = None
 
 
 # ── Shared schema description ─────────────────────────────────────────────────
@@ -63,6 +68,10 @@ Dates are stored as DATE type. Revenue = l_extendedprice * (1 - l_discount).
 TASKS: list[Task] = [
 
     # ── SMALL tier ────────────────────────────────────────────────────────────
+
+    # Validation keys are computed from gold SQL on SF=1 data.
+    # They're checked as substrings in the agent's final answer (case-insensitive).
+    # Run setup/compute_validation_keys.py to refresh these for other SFs.
 
     Task(
         name="q6_discount_revenue",

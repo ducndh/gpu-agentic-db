@@ -1,24 +1,20 @@
 """
-Experiment B: Fully agentic SQL generation.
+Experiment C: Production-grade inference on L40S via vLLM.
 
-The LLM receives the question and schema, generates SQL queries in a ReAct
-loop, and arrives at a final answer. All stages are timed.
+Same agentic ReAct loop as Exp B, but with:
+  - vLLM instead of llama.cpp (flash attention, prefix caching, real TTFT)
+  - Larger models (7B BF16, 14B BF16, 32B AWQ) enabled by 48GB VRAM
+  - Real prefill/decode split via RequestOutput.metrics (no estimation)
+  - Prefix caching ON by default — simulates production multi-turn serving
 
-Key design decisions:
-  - LLM is loaded ONCE per model and reused across all combos
-  - Fallback to gold SQL when the LLM produces invalid SQL (keeps timing
-    clean; failure rate is tracked as a separate metric)
-  - max_turns=5 to cap runaway agents
+This gives accurate data_path_pct under a modern inference stack, answering:
+  "Is data path still negligible when LLM inference is 5-10x faster?"
 
-Sweep dimensions:
-  - backend:      duckdb_cpu  |  sirius_gpu
-  - scale_factor: 1 | 5 | 10
-  - model:        all models in MODEL_CONFIGS
-  - task:         all tasks in TASKS
-
-Run:
-    python experiments/exp_b_agentic.py --sf 1 --models qwen2.5-1.5b-q4_k_m --tasks q6
-    python experiments/exp_b_agentic.py    # full sweep
+Run on L40S:
+    pip install vllm
+    python experiments/exp_c_vllm_l40s.py --sf 1 --models qwen2.5-7b --tasks q6
+    python experiments/exp_c_vllm_l40s.py          # full sweep
+    python experiments/exp_c_vllm_l40s.py --no-prefix-cache   # compare w/o caching
 """
 
 import argparse
@@ -34,28 +30,40 @@ from tokenizers import Tokenizer
 from core.agent import ReactAgent
 from core.backends.duckdb_cpu import DuckDBCPUBackend
 from core.backends.sirius_gpu import SiriusGPUBackend
-from core.llm.llama_backend import LlamaBackend
+from core.llm.vllm_backend import VLLMBackend
 from tasks.tpch import TASKS
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
 PROJECT_ROOT = Path(__file__).parent.parent
-MODELS_DIR   = PROJECT_ROOT / "models"
 DATA_DIR     = PROJECT_ROOT / "data"
 RESULTS_DIR  = PROJECT_ROOT / "results"
 VALIDATION_KEYS_FILE = RESULTS_DIR / "validation_keys.json"
 
+# Models available on L40S (48GB VRAM)
+# BF16 memory: 7B~15GB, 14B~29GB, 32B~65GB (use AWQ for 32B)
 MODEL_CONFIGS = [
-    {"name": "qwen2.5-1.5b-q4_k_m",
-     "path": str(MODELS_DIR / "qwen2.5-1.5b-instruct-q4_k_m.gguf"), "n_ctx": 16384},
-    {"name": "qwen2.5-7b-q2_k",
-     "path": str(MODELS_DIR / "qwen2.5-7b-instruct-q2_k.gguf"), "n_ctx": 16384},
-    {"name": "qwen2.5-7b-q4_k_m",
-     "path": str(MODELS_DIR / "qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf"), "n_ctx": 16384},
-    {"name": "qwen2.5-7b-q8_0",
-     "path": str(MODELS_DIR / "qwen2.5-7b-instruct-q8_0-00001-of-00003.gguf"), "n_ctx": 16384},
-    {"name": "qwen2.5-14b-q4_k_m",
-     "path": str(MODELS_DIR / "qwen2.5-14b-instruct-q4_k_m-00001-of-00003.gguf"), "n_ctx": 16384},
+    {
+        "name": "qwen2.5-7b-bf16",
+        "hf_id": "Qwen/Qwen2.5-7B-Instruct",
+        "dtype": "auto",
+        "quantization": None,
+        "max_model_len": 16384,
+    },
+    {
+        "name": "qwen2.5-14b-bf16",
+        "hf_id": "Qwen/Qwen2.5-14B-Instruct",
+        "dtype": "auto",
+        "quantization": None,
+        "max_model_len": 16384,
+    },
+    {
+        "name": "qwen2.5-32b-awq",
+        "hf_id": "Qwen/Qwen2.5-32B-Instruct-AWQ",
+        "dtype": "auto",
+        "quantization": "awq",
+        "max_model_len": 8192,
+    },
 ]
 
 BACKENDS      = ["duckdb_cpu", "sirius_gpu"]
@@ -69,14 +77,13 @@ def db_path(sf: int) -> str:
 
 def load_validation_keys() -> dict:
     if VALIDATION_KEYS_FILE.exists():
-        import json
         with open(VALIDATION_KEYS_FILE) as f:
             return json.load(f)
     return {}
 
 
 def run_one(
-    llm: LlamaBackend,
+    llm: VLLMBackend,
     model_cfg: dict,
     backend_name: str,
     sf: int,
@@ -84,22 +91,12 @@ def run_one(
     tokenizer: Tokenizer,
     validation_keys: dict,
 ) -> dict:
-    """
-    Run the full ReAct agent loop with a pre-loaded LLM.
-    Uses validation keys for retry-until-correct behavior.
-    """
     dpath = db_path(sf)
-
-    # Look up expected answer for this task + SF
     vkey = validation_keys.get(task.name, {}).get(str(sf))
 
-    if backend_name == "sirius_gpu":
-        backend_cls = SiriusGPUBackend
-    else:
-        backend_cls = DuckDBCPUBackend
+    backend_cls = SiriusGPUBackend if backend_name == "sirius_gpu" else DuckDBCPUBackend
 
     with backend_cls(dpath) as backend:
-        # Warmup: run gold SQL to populate DB/GPU caches
         for _ in range(N_WARMUP):
             backend.warmup(task.gold_sql)
 
@@ -109,7 +106,7 @@ def run_one(
             tokenizer=tokenizer,
             max_turns=10,
             fallback_sql=task.gold_sql,
-            max_retries=2,          # retry up to 2 more times if answer is wrong
+            max_retries=2,
         )
 
         record = agent.run(
@@ -119,33 +116,38 @@ def run_one(
             backend_name=backend_name,
             model_name=model_cfg["name"],
             scale_factor=sf,
-            validation_key=vkey,    # checks if correct answer found
+            validation_key=vkey,
         )
 
     return record.to_dict()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Experiment B: Fully agentic SQL")
+    parser = argparse.ArgumentParser(description="Experiment C: vLLM on L40S")
     parser.add_argument("--sf",       nargs="+", type=int, default=SCALE_FACTORS)
     parser.add_argument("--models",   nargs="+")
     parser.add_argument("--tasks",    nargs="+")
     parser.add_argument("--backends", nargs="+", default=BACKENDS, choices=BACKENDS)
-    parser.add_argument("--output",   default=str(RESULTS_DIR / "exp_b_agentic.json"))
-    parser.add_argument("--resume",   action="store_true",
-                        help="Load existing output and skip already-completed runs")
+    parser.add_argument("--output",   default=str(RESULTS_DIR / "exp_c_vllm_l40s.json"))
+    parser.add_argument("--no-prefix-cache", action="store_true",
+                        help="Disable prefix caching (shows cost without production optimization)")
+    parser.add_argument("--gpu-mem",  type=float, default=0.90,
+                        help="GPU memory utilization fraction for vLLM (default 0.90)")
     args = parser.parse_args()
 
-    model_cfgs   = MODEL_CONFIGS
+    model_cfgs = MODEL_CONFIGS
     if args.models:
-        model_cfgs = [m for m in MODEL_CONFIGS if m["name"] in args.models]
+        model_cfgs = [m for m in MODEL_CONFIGS if m["name"] in args.models
+                      or m["hf_id"].split("/")[-1].lower() in args.models]
     tasks_to_run = TASKS
     if args.tasks:
-        tasks_to_run = [t for t in TASKS if t.name in args.tasks]
+        tasks_to_run = [t for t in TASKS if t.name in args.tasks
+                        or any(a in t.name for a in args.tasks)]
 
     RESULTS_DIR.mkdir(exist_ok=True)
+    enable_prefix_caching = not args.no_prefix_cache
 
-    print("Loading tokenizer...")
+    print("Loading tokenizer (for data-path measurement only)...")
     try:
         tokenizer = Tokenizer.from_pretrained("Qwen/Qwen2.5-1.5B-Instruct")
         print("  Loaded Qwen2.5 tokenizer")
@@ -154,44 +156,32 @@ def main():
         print("  Loaded GPT-2 tokenizer (fallback)")
 
     validation_keys = load_validation_keys()
-    if validation_keys:
-        print(f"  Loaded validation keys for {len(validation_keys)} tasks")
-    else:
-        print("  No validation keys found — answers will not be validated")
+    print(f"  Validation keys: {len(validation_keys)} tasks")
+    print(f"  Prefix caching: {'ON' if enable_prefix_caching else 'OFF'}")
 
-    # Load previously completed runs for --resume
-    completed_keys: set = set()
     all_results = []
-    if args.resume and Path(args.output).exists():
-        with open(args.output) as f:
-            all_results = json.load(f)
-        for r in all_results:
-            completed_keys.add((r["model"], r["backend"], r["scale_factor"], r["task"]))
-        print(f"  Resuming: {len(completed_keys)} runs already done")
-
     total = len(model_cfgs) * len(args.backends) * len(args.sf) * len(tasks_to_run)
     run_n = 0
 
     for model_cfg in model_cfgs:
-        if not Path(model_cfg["path"]).exists():
-            print(f"\n[SKIP] {model_cfg['name']}: model file not found")
-            continue
-
         print(f"\n{'='*70}")
-        print(f"Loading model: {model_cfg['name']}")
+        print(f"Loading model: {model_cfg['name']}  ({model_cfg['hf_id']})")
+        print(f"  dtype={model_cfg['dtype']}  quantization={model_cfg['quantization']}")
         print(f"{'='*70}")
 
-        llm = LlamaBackend(
-            model_path=model_cfg["path"],
-            n_ctx=model_cfg["n_ctx"],
-            n_gpu_layers=-1,
+        llm = VLLMBackend(
+            model=model_cfg["hf_id"],
+            dtype=model_cfg["dtype"],
+            quantization=model_cfg["quantization"],
+            max_model_len=model_cfg["max_model_len"],
+            gpu_memory_utilization=args.gpu_mem,
+            enable_prefix_caching=enable_prefix_caching,
             temperature=0.0,
             max_tokens=512,
-            verbose=False,
         )
 
         with llm:
-            print(f"  Model loaded.")
+            print("  Model loaded.")
 
             for backend_name in args.backends:
                 for sf in args.sf:
@@ -200,15 +190,13 @@ def main():
                         continue
                     for task in tasks_to_run:
                         run_n += 1
-                        run_key = (model_cfg["name"], backend_name, sf, task.name)
-                        if run_key in completed_keys:
-                            print(f"\n  [{run_n}/{total}] SKIP (already done): {backend_name} | SF={sf} | {task.name}")
-                            continue
                         print(f"\n  [{run_n}/{total}] {backend_name} | SF={sf} | {task.name}")
                         t0 = time.time()
                         try:
-                            result = run_one(llm, model_cfg, backend_name, sf, task, tokenizer, validation_keys)
+                            result = run_one(llm, model_cfg, backend_name, sf, task,
+                                             tokenizer, validation_keys)
                             result["status"] = "ok"
+                            result["prefix_caching"] = enable_prefix_caching
                         except Exception as e:
                             import traceback
                             traceback.print_exc()
@@ -216,15 +204,15 @@ def main():
                                 "task": task.name, "backend": backend_name,
                                 "model": model_cfg["name"], "scale_factor": sf,
                                 "mode": "agentic", "status": "error", "error": str(e),
+                                "prefix_caching": enable_prefix_caching,
                             }
-                        correct = result.get("answer_correct", "?")
-                        retries = result.get("n_retries", 0)
                         print(
                             f"    total={result.get('total_ms','?')}ms  "
                             f"turns={result.get('n_turns','?')}  "
                             f"data_path={result.get('data_path_pct','?')}%  "
                             f"incr_dp={result.get('incr_data_path_pct','?')}%  "
-                            f"correct={correct}  retries={retries}  "
+                            f"correct={result.get('answer_correct','?')}  "
+                            f"retries={result.get('n_retries',0)}  "
                             f"wall={time.time()-t0:.1f}s"
                         )
                         all_results.append(result)

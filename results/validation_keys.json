@@ -1,0 +1,32 @@
+{
+  "q6_discount_revenue": {
+    "1": "61567694",
+    "5": "30798470",
+    "10": "61666215"
+  },
+  "q1_lineitem_summary": {
+    "1": "A",
+    "5": "A",
+    "10": "A"
+  },
+  "q3_unshipped_revenue": {
+    "1": "4994400",
+    "5": "6629573",
+    "10": "37911232"
+  },
+  "q5_europe_revenue": {
+    "1": "ROMANIA",
+    "5": "UNITED KINGDOM",
+    "10": "GERMANY"
+  },
+  "q16_supplier_count": {
+    "1": "Brand#45",
+    "5": "Brand#44",
+    "10": "Brand#12"
+  },
+  "large_shipment_scan": {
+    "1": "3517155",
+    "5": "18000642",
+    "10": "36850246"
+  }
+}

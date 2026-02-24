@@ -58,16 +58,18 @@ def print_summary(results: list[dict]):
             r["mode"],
             r["total_ms"],
             bd.get("sql_exec", 0),
-            bd.get("fetch", 0) + bd.get("serialize", 0) + bd.get("tokenize", 0),
-            bd.get("llm_prefill", 0) + bd.get("llm_gen", 0),
+            round(bd.get("fetch", 0) + bd.get("serialize", 0) + bd.get("tokenize", 0), 2),
+            round(bd.get("llm_prefill", 0) + bd.get("llm_gen", 0), 2),
             r["data_path_pct"],
             r["colocation_speedup"],
+            r.get("answer_correct", "N/A"),
+            r.get("n_retries", "N/A"),
         ])
 
     headers = [
         "model", "backend", "SF", "task", "mode",
         "total_ms", "sql_ms", "data_path_ms", "llm_ms",
-        "data_path_%", "ceiling_x",
+        "data_path_%", "ceiling_x", "correct", "retries",
     ]
     print(_table(rows, headers))
 
@@ -206,6 +208,98 @@ def print_sirius_vs_duckdb(results: list[dict]):
     print(_table(rows, headers))
 
 
+def print_incremental_ceiling(results: list[dict]):
+    """Table 6: KV-cache-aware ceiling for multi-turn ReAct.
+
+    In multi-turn agentic workflows, each extra turn's LLM cost (with KV cache)
+    is only the incremental prefill of new observation tokens + decode.
+    Data-path (fetch+serialize+tokenize) accumulates at the same rate.
+    This table shows how the colocation ceiling changes when accounting for this.
+    """
+    # Only include agentic runs with >1 turn (single-turn has no KV cache benefit)
+    agentic = [r for r in results if r.get("mode") == "agentic" and r.get("n_turns", 1) > 1]
+    if not agentic:
+        # Fall back to all runs if no multi-turn data
+        agentic = results
+
+    print("\n" + "="*90)
+    print("TABLE 6: KV-Cache-Aware Colocation Ceiling (Multi-Turn ReAct)")
+    print("  incr_data_path_% = data_path / (data_path + incremental LLM per turn)")
+    print("  With KV cache: each turn's LLM work ≈ process new observation tokens + decode")
+    print("  This is the accurate ceiling for a real agentic workflow vs single-turn exp_a")
+    print("="*90)
+
+    from collections import defaultdict
+    by_model: dict[str, list] = defaultdict(list)
+    for r in agentic:
+        by_model[r["model"]].append(r)
+
+    rows = []
+    for model, mrs in sorted(by_model.items()):
+        avg_turns = sum(r.get("n_turns", 1) for r in mrs) / len(mrs)
+        avg_dp    = sum(r["data_path_pct"] for r in mrs) / len(mrs)
+        avg_idp   = sum(r.get("incr_data_path_pct", r["data_path_pct"]) for r in mrs) / len(mrs)
+        max_idp   = max(r.get("incr_data_path_pct", r["data_path_pct"]) for r in mrs)
+        rows.append([model, len(mrs), round(avg_turns, 1),
+                     round(avg_dp, 1), round(avg_idp, 1), round(max_idp, 1)])
+
+    headers = ["model", "n_runs", "avg_turns",
+               "naive_data_path_%", "incr_data_path_%", "max_incr_data_path_%"]
+    print(_table(rows, headers))
+    print()
+    print("  naive_data_path_%  = data_path / total  (exp_a metric, under-counts colocation value)")
+    print("  incr_data_path_%   = data_path / (data_path + incr_LLM)  (correct for multi-turn)")
+
+
+def print_inference_stack_comparison(results: list[dict]):
+    """Table 7: llama.cpp vs vLLM — how inference speed affects data-path fraction."""
+    # Detect which stack each result came from based on mode/model name heuristics
+    # vLLM runs have model names like "qwen2.5-7b-bf16", llama.cpp use "qwen2.5-7b-q4_k_m"
+    vllm_runs  = [r for r in results if "bf16" in r.get("model","") or "awq" in r.get("model","")]
+    llama_runs = [r for r in results if any(q in r.get("model","")
+                  for q in ("q2_k","q4_k_m","q8_0","q4_km","q2k","q8"))]
+    if not vllm_runs or not llama_runs:
+        return  # Only print when both stacks are present
+
+    print("\n" + "="*90)
+    print("TABLE 7: Inference Stack Comparison — llama.cpp vs vLLM")
+    print("  Shows how data-path fraction changes as LLM inference gets faster")
+    print("="*90)
+
+    def summarise(runs, label):
+        if not runs:
+            return []
+        avg_total   = sum(r["total_ms"] for r in runs) / len(runs)
+        avg_dp      = sum(r["data_path_pct"] for r in runs) / len(runs)
+        avg_idp     = sum(r.get("incr_data_path_pct", r["data_path_pct"]) for r in runs) / len(runs)
+        avg_turns   = sum(r.get("n_turns", 1) for r in runs) / len(runs)
+        bd_totals: dict = {}
+        for r in runs:
+            for k, v in r.get("stage_breakdown_ms", {}).items():
+                bd_totals[k] = bd_totals.get(k, 0) + v
+        n = len(runs)
+        avg_decode  = bd_totals.get("llm_gen", 0) / n
+        avg_prefill = bd_totals.get("llm_prefill", 0) / n
+        return [label, n, round(avg_turns, 1), round(avg_total, 0),
+                round(avg_prefill, 0), round(avg_decode, 0),
+                round(avg_dp, 2), round(avg_idp, 1)]
+
+    rows = [
+        summarise(llama_runs, "llama.cpp (GGUF quant)"),
+        summarise(vllm_runs,  "vLLM (BF16/AWQ)"),
+    ]
+    rows = [r for r in rows if r]
+    headers = ["stack", "n_runs", "avg_turns", "avg_total_ms",
+               "avg_prefill_ms", "avg_decode_ms",
+               "naive_dp_%", "incr_dp_%"]
+    print(_table(rows, headers))
+    if len(rows) == 2:
+        speedup = rows[0][3] / rows[1][3] if rows[1][3] > 0 else 0
+        dp_ratio = rows[1][7] / rows[0][7] if rows[0][7] > 0 else 0
+        print(f"\n  vLLM is {speedup:.1f}x faster overall")
+        print(f"  Data-path fraction is {dp_ratio:.1f}x larger with vLLM (relatively more important)")
+
+
 def main():
     if len(sys.argv) < 2:
         print("Usage: python analysis/report.py <results.json> [results2.json ...]")
@@ -223,12 +317,22 @@ def main():
     print_colocation_by_result_size(results)
     print_model_size_effect(results)
     print_sirius_vs_duckdb(results)
+    print_incremental_ceiling(results)
+    print_inference_stack_comparison(results)
 
     print("\n" + "="*90)
     print("COLOCATION VERDICT")
     print("="*90)
     avg_dp = sum(r["data_path_pct"] for r in results) / len(results)
     max_dp = max(r["data_path_pct"] for r in results)
+    # Use incremental metric if available (multi-turn agentic runs)
+    has_incr = any("incr_data_path_pct" in r for r in results)
+    if has_incr:
+        avg_idp = sum(r.get("incr_data_path_pct", r["data_path_pct"]) for r in results) / len(results)
+        max_idp = max(r.get("incr_data_path_pct", r["data_path_pct"]) for r in results)
+        print(f"Naive data-path % (total LLM denominator): avg={avg_dp:.1f}%  max={max_dp:.1f}%")
+        print(f"KV-cache incr data-path % (per-turn):      avg={avg_idp:.1f}%  max={max_idp:.1f}%")
+        avg_dp, max_dp = avg_idp, max_idp
     if max_dp < 5:
         verdict = "NOT WORTH IT — data path < 5% even in worst case. LLM inference dominates."
     elif avg_dp < 5 and max_dp < 15:

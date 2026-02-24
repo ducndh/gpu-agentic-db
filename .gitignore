@@ -7,4 +7,5 @@ __pycache__/
 *.egg-info/
 .DS_Store
 results/*.json
+!results/validation_keys.json
 !results/.gitkeep
