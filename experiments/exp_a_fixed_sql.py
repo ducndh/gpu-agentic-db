@@ -1,20 +1,25 @@
 """
 Experiment A: Fixed SQL + LLM summarization.
 
-The SQL queries are predefined (gold SQL from tasks.py). The LLM only does
-two things per turn:
-  1. Summarizes the query result in natural language
-  2. (Optionally) decides if it needs another query
+The SQL queries are predefined (gold SQL from tasks.py). The LLM only
+summarizes the result in natural language. This ISOLATES data-path
+overhead from LLM SQL-generation quality.
 
-This cleanly ISOLATES the data-path overhead from LLM SQL-generation quality:
-  - Timing is NOT affected by whether the LLM writes good or bad SQL
-  - Directly measures: fetch + serialize + tokenize as % of (SQL + LLM time)
+Key design decisions:
+  - LLM is loaded ONCE per model and reused across all backend/task combos
+    (stable timings, no model-load variance, realistic for long-running agents)
+  - SQL is executed N_WARMUP times to warm up the DB cache before timing
+  - Each (backend, SF, task) is run N_ITER times; results are averaged
 
-Compare with Experiment B to understand:
-  - How much of the latency is "LLM SQL writing quality" (B - A)
-  - The pure colocation ceiling independent of SQL generation (from A)
+Sweep dimensions:
+  - backend:      duckdb_cpu  |  sirius_gpu
+  - scale_factor: 1 | 5 | 10
+  - model:        all models in MODEL_CONFIGS
+  - task:         all tasks in TASKS
 
-Sweep dimensions: same as Experiment B
+Run:
+    python experiments/exp_a_fixed_sql.py --sf 1 --models qwen2.5-1.5b-q4_k_m --tasks q6
+    python experiments/exp_a_fixed_sql.py           # full sweep
 """
 
 import argparse
@@ -34,7 +39,7 @@ from core.llm.llama_backend import LlamaBackend
 from core.timer import RunRecord, StageTimer, TurnRecord
 from tasks.tpch import TASKS
 
-# ── Config (same paths as exp_b) ──────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────
 
 PROJECT_ROOT = Path(__file__).parent.parent
 MODELS_DIR   = PROJECT_ROOT / "models"
@@ -57,34 +62,66 @@ MODEL_CONFIGS = [
 
 BACKENDS      = ["duckdb_cpu", "sirius_gpu"]
 SCALE_FACTORS = [1, 5, 10]
+N_WARMUP      = 2   # SQL warmup runs (not timed)
+N_ITER        = 3   # Timed iterations to average
 
 SUMMARIZE_PROMPT = """\
-Here is the result of a SQL query run against a database:
+Here is the result of a SQL query run against a TPC-H database:
 
 {result_table}
 
-Please write a concise 2-3 sentence summary of what this data shows.
-Focus on the key insight, not every row.
+Write a concise 2-3 sentence summary of what this data shows.
+Focus on the key insight.
 """
 
 
+def measure_one_sql(
+    backend,
+    sql: str,
+    tokenizer: Tokenizer,
+    backend_name: str,
+) -> TurnRecord:
+    """
+    Execute SQL + data path pipeline once.
+    Returns a TurnRecord with sql_exec, fetch, serialize, tokenize stages.
+    LLM stages are NOT included here — they're measured separately and added later.
+    """
+    turn = TurnRecord(turn_idx=0)
+
+    try:
+        qr: QueryResult = backend.execute(sql)
+    except Exception as e:
+        qr = QueryResult([], [], 0.0, 0.0, backend_name, str(e))
+
+    turn.add("sql_exec", qr.exec_ms, n_rows=qr.n_rows, ok=qr.ok)
+    turn.add("fetch",    qr.fetch_ms, n_rows=qr.n_rows)
+
+    with StageTimer() as ser:
+        result_text = format_result_as_markdown(qr.columns, qr.rows)
+    turn.add("serialize", ser.elapsed_ms, n_bytes=len(result_text.encode()))
+
+    with StageTimer() as tok:
+        encoding = tokenizer.encode(result_text)
+    turn.add("tokenize", tok.elapsed_ms, n_tokens=len(encoding.ids))
+
+    # Store result_text for LLM call
+    turn._result_text = result_text  # type: ignore[attr-defined]
+    return turn
+
+
 def run_one_fixed(
+    llm: LlamaBackend,
     model_cfg: dict,
     backend_name: str,
     sf: int,
     task,
     tokenizer: Tokenizer,
 ) -> dict:
-    """Run gold SQL, then ask LLM to summarize. Time every stage."""
-
-    llm = LlamaBackend(
-        model_path=model_cfg["path"],
-        n_ctx=model_cfg["n_ctx"],
-        n_gpu_layers=-1,
-        temperature=0.0,
-        max_tokens=256,
-        verbose=False,
-    )
+    """
+    Run gold SQL N_ITER times, average stage timings, then summarize with LLM.
+    Returns a result dict.
+    """
+    dpath = str(DATA_DIR / f"tpch_sf{sf}.duckdb")
 
     record = RunRecord(
         task_name=task.name,
@@ -94,56 +131,56 @@ def run_one_fixed(
         mode="fixed_sql",
     )
 
-    dpath = str(DATA_DIR / f"tpch_sf{sf}.duckdb")
+    if backend_name == "sirius_gpu":
+        backend_cls = SiriusGPUBackend
+    else:
+        backend_cls = DuckDBCPUBackend
 
-    with llm:
-        if backend_name == "sirius_gpu":
-            backend = SiriusGPUBackend(dpath)
-        else:
-            backend = DuckDBCPUBackend(dpath)
-
-        with backend:
+    with backend_cls(dpath) as backend:
+        # Warmup: run gold SQL N_WARMUP times to populate DB/GPU caches
+        for _ in range(N_WARMUP):
             backend.warmup(task.gold_sql)
 
-            turn = TurnRecord(turn_idx=0)
+        # Timed iterations for SQL + data path
+        sql_turns = []
+        for _ in range(N_ITER):
+            sql_turns.append(
+                measure_one_sql(backend, task.gold_sql, tokenizer, backend_name)
+            )
 
-            # ── Execute gold SQL ───────────────────────────────────────────────
-            try:
-                qr: QueryResult = backend.execute(task.gold_sql)
-            except Exception as e:
-                qr = QueryResult([], [], 0.0, 0.0, backend_name, str(e))
+        # Use the last iteration's result_text for the LLM call (most representative)
+        result_text = getattr(sql_turns[-1], "_result_text", "(no result)")
 
-            if qr.ok:
-                record.sql_success_count += 1
-            else:
-                record.sql_failure_count += 1
+    # Average SQL + data path timings across iterations
+    avg_turn = TurnRecord(turn_idx=0)
+    for stage in ("sql_exec", "fetch", "serialize", "tokenize"):
+        vals = [t.get(stage) or 0.0 for t in sql_turns]
+        avg_ms = sum(vals) / len(vals) if vals else 0.0
+        # Collect metadata from last run
+        last_meta = next(
+            (r.metadata for t in sql_turns for r in t.records if r.stage == stage),
+            {}
+        )
+        avg_turn.add(stage, avg_ms, **last_meta)
 
-            turn.add("sql_exec", qr.exec_ms, n_rows=qr.n_rows)
-            turn.add("fetch",    qr.fetch_ms, n_rows=qr.n_rows)
+    record.sql_success_count = sum(
+        1 for t in sql_turns
+        for r in t.records if r.stage == "sql_exec" and r.metadata.get("ok", True)
+    )
 
-            # ── Serialize ──────────────────────────────────────────────────────
-            with StageTimer() as ser:
-                result_text = format_result_as_markdown(qr.columns, qr.rows)
-            turn.add("serialize", ser.elapsed_ms, n_bytes=len(result_text.encode()))
+    # LLM summarization (1 call — already loaded LLM, no model-load overhead)
+    prompt = SUMMARIZE_PROMPT.format(result_table=result_text)
+    messages = [{"role": "user", "content": prompt}]
+    llm_resp = llm.chat(messages)
 
-            # ── Tokenize ───────────────────────────────────────────────────────
-            with StageTimer() as tok:
-                encoding = tokenizer.encode(result_text)
-            n_tokens = len(encoding.ids)
-            turn.add("tokenize", tok.elapsed_ms, n_tokens=n_tokens)
+    avg_turn.add("llm_prefill", llm_resp.prefill_ms,
+                 n_prompt_tokens=llm_resp.n_prompt_tokens)
+    avg_turn.add("llm_gen", llm_resp.decode_ms,
+                 n_output_tokens=llm_resp.n_output_tokens,
+                 tokens_per_sec=round(llm.tokens_per_second(llm_resp), 1))
 
-            # ── LLM: summarize result ──────────────────────────────────────────
-            prompt = SUMMARIZE_PROMPT.format(result_table=result_text)
-            messages = [{"role": "user", "content": prompt}]
-            llm_resp = llm.chat(messages)
-
-            turn.add("llm_prefill", llm_resp.prefill_ms,
-                     n_prompt_tokens=llm_resp.n_prompt_tokens)
-            turn.add("llm_gen", llm_resp.decode_ms,
-                     n_output_tokens=llm_resp.n_output_tokens)
-
-            record.add_turn(turn)
-            record.final_answer = llm_resp.text
+    record.add_turn(avg_turn)
+    record.final_answer = llm_resp.text
 
     return record.to_dict()
 
@@ -157,10 +194,10 @@ def main():
     parser.add_argument("--output",   default=str(RESULTS_DIR / "exp_a_fixed_sql.json"))
     args = parser.parse_args()
 
-    model_cfgs    = MODEL_CONFIGS
+    model_cfgs   = MODEL_CONFIGS
     if args.models:
         model_cfgs = [m for m in MODEL_CONFIGS if m["name"] in args.models]
-    tasks_to_run  = TASKS
+    tasks_to_run = TASKS
     if args.tasks:
         tasks_to_run = [t for t in TASKS if t.name in args.tasks]
 
@@ -174,50 +211,67 @@ def main():
         tokenizer = Tokenizer.from_pretrained("gpt2")
         print("  Loaded GPT-2 tokenizer (fallback)")
 
-    results  = []
-    total    = len(model_cfgs) * len(args.backends) * len(args.sf) * len(tasks_to_run)
-    run_n    = 0
+    all_results = []
+    total = len(model_cfgs) * len(args.backends) * len(args.sf) * len(tasks_to_run)
+    run_n = 0
 
     for model_cfg in model_cfgs:
         if not Path(model_cfg["path"]).exists():
-            print(f"  [SKIP] {model_cfg['name']}: model file not found")
+            print(f"\n[SKIP] {model_cfg['name']}: model file not found")
             continue
 
         print(f"\n{'='*70}")
-        print(f"Model: {model_cfg['name']}")
+        print(f"Loading model: {model_cfg['name']}")
         print(f"{'='*70}")
 
-        for backend_name in args.backends:
-            for sf in args.sf:
-                dpath = DATA_DIR / f"tpch_sf{sf}.duckdb"
-                if not dpath.exists():
-                    print(f"  [SKIP] DB not found: tpch_sf{sf}.duckdb")
-                    continue
-                for task in tasks_to_run:
-                    run_n += 1
-                    print(f"\n[{run_n}/{total}] {model_cfg['name']} | {backend_name} | SF={sf} | {task.name}")
-                    t0 = time.time()
-                    try:
-                        result = run_one_fixed(model_cfg, backend_name, sf, task, tokenizer)
-                        result["status"] = "ok"
-                    except Exception as e:
-                        print(f"  ERROR: {e}")
-                        result = {
-                            "task": task.name, "backend": backend_name,
-                            "model": model_cfg["name"], "scale_factor": sf,
-                            "mode": "fixed_sql", "status": "error", "error": str(e),
-                        }
-                    print(
-                        f"  total={result.get('total_ms','?')}ms  "
-                        f"data_path={result.get('data_path_pct','?')}%  "
-                        f"ceiling_speedup={result.get('colocation_speedup','?')}x  "
-                        f"wall={time.time()-t0:.1f}s"
-                    )
-                    results.append(result)
-                    with open(args.output, "w") as f:
-                        json.dump(results, f, indent=2)
+        # Load LLM ONCE per model — reused across all backend/SF/task combos
+        llm = LlamaBackend(
+            model_path=model_cfg["path"],
+            n_ctx=model_cfg["n_ctx"],
+            n_gpu_layers=-1,
+            temperature=0.0,
+            max_tokens=256,
+            verbose=False,
+        )
 
-    print(f"\nDone. Results saved to {args.output}")
+        with llm:
+            print(f"  Model loaded. Running {len(args.backends)} × {len(args.sf)} × {len(tasks_to_run)} combinations...")
+
+            for backend_name in args.backends:
+                for sf in args.sf:
+                    dpath = DATA_DIR / f"tpch_sf{sf}.duckdb"
+                    if not dpath.exists():
+                        print(f"  [SKIP] DB not found: tpch_sf{sf}.duckdb")
+                        continue
+                    for task in tasks_to_run:
+                        run_n += 1
+                        print(
+                            f"\n  [{run_n}/{total}] {backend_name} | SF={sf} | {task.name}"
+                            f"  (avg of {N_ITER} SQL runs)"
+                        )
+                        t0 = time.time()
+                        try:
+                            result = run_one_fixed(llm, model_cfg, backend_name, sf, task, tokenizer)
+                            result["status"] = "ok"
+                        except Exception as e:
+                            import traceback
+                            traceback.print_exc()
+                            result = {
+                                "task": task.name, "backend": backend_name,
+                                "model": model_cfg["name"], "scale_factor": sf,
+                                "mode": "fixed_sql", "status": "error", "error": str(e),
+                            }
+                        print(
+                            f"    total={result.get('total_ms','?')}ms  "
+                            f"data_path={result.get('data_path_pct','?')}%  "
+                            f"ceiling={result.get('colocation_speedup','?')}x  "
+                            f"wall={time.time()-t0:.1f}s"
+                        )
+                        all_results.append(result)
+                        with open(args.output, "w") as f:
+                            json.dump(all_results, f, indent=2)
+
+    print(f"\nDone. {len(all_results)} runs saved to {args.output}")
 
 
 if __name__ == "__main__":

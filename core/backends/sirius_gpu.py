@@ -39,8 +39,19 @@ GPU_PROC_SIZE = "2 GB"
 def _worker_script(db_path: str, ext_path: str, cache: str, proc: str) -> str:
     """Generate the Python worker script source code."""
     return textwrap.dedent(f"""\
-        import sys, json, time, traceback
+        import sys, json, time, traceback, decimal, datetime
         import duckdb
+
+        def _to_json_safe(v):
+            # Convert DB values to JSON-serializable types
+            if isinstance(v, decimal.Decimal):
+                return float(v)
+            if isinstance(v, (datetime.date, datetime.datetime)):
+                return str(v)
+            if isinstance(v, bytes):
+                return v.decode("utf-8", errors="replace")
+            return v
+
 
         db_path  = {db_path!r}
         ext_path = {ext_path!r}
@@ -67,21 +78,27 @@ def _worker_script(db_path: str, ext_path: str, cache: str, proc: str) -> str:
 
             sql = req.get("sql", "")
             try:
+                # Normalize SQL for embedding in a DuckDB string literal:
+                #   1. Collapse whitespace (newlines → spaces)
+                #   2. Escape internal single quotes by doubling them (' → '')
+                #      so the query can be wrapped in single quotes:
+                #        call gpu_processing('SELECT ... DATE ''1997-01-01'' ...')
+                sql_normalized = " ".join(sql.split()).replace("'", "''")
+
                 t0 = time.perf_counter()
-                cursor = con.execute(f'call gpu_processing("{{sql}}")')
-                t1 = time.perf_counter()
+                # For Sirius, execute() submits the call but the GPU query
+                # often runs during fetchall(). We time exec+fetch together as
+                # exec_ms (the true "query execution" cost) and set fetch_ms=0.
+                cursor = con.execute("call gpu_processing('" + sql_normalized + "')")
                 rows = cursor.fetchall()
-                t2 = time.perf_counter()
+                t1 = time.perf_counter()
                 columns = [d[0] for d in cursor.description] if cursor.description else []
-                # gpu_processing returns a result set with one column 'result'
-                # which contains the actual query output as a table — unwrap it
-                # Actually sirius returns rows directly; columns come from description
                 resp = {{
                     "id": rid, "ok": True,
                     "columns": columns,
-                    "rows": [list(r) for r in rows],
+                    "rows": [[_to_json_safe(v) for v in r] for r in rows],
                     "exec_ms": (t1 - t0) * 1000,
-                    "fetch_ms": (t2 - t1) * 1000,
+                    "fetch_ms": 0.0,   # already included in exec_ms
                 }}
             except Exception as e:
                 resp = {{"id": rid, "ok": False, "error": str(e)}}
@@ -172,14 +189,35 @@ class SiriusGPUBackend:
         )
 
     def close(self):
-        if self._proc and self._proc.poll() is None:
-            try:
-                self._send({"action": "shutdown"})
-                self._proc.wait(timeout=5.0)
-            except Exception:
-                self._proc.kill()
+        proc = self._proc
         self._proc = None
         self._ready = False
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None:
+                try:
+                    proc.stdin.write(json.dumps({"action": "shutdown"}) + "\n")
+                    proc.stdin.flush()
+                except Exception:
+                    pass
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=5.0)
+                except Exception:
+                    proc.kill()
+            # Close all pipes to prevent BrokenPipe during GC
+            for pipe in (proc.stdin, proc.stdout, proc.stderr):
+                try:
+                    if pipe and not pipe.closed:
+                        pipe.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def __enter__(self):
         self.connect()
