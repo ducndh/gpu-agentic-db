@@ -172,7 +172,7 @@ With vLLM (Exp C), `prefill_ms` is the real TTFT from `RequestOutput.metrics`.
 
 **DuckDB CPU** (`duckdb_cpu`): in-process DuckDB 1.4.4.
 
-**Sirius GPU** (`sirius_gpu`): long-lived Python subprocess using `.venv/sirius` (duckdb==1.4.3 + Sirius extension). Communicates JSON over stdin/stdout. Requires Sirius installed at `/home/cc/sirius/`. Runs are skipped gracefully if unavailable.
+**Sirius GPU** (`sirius_gpu`): long-lived Python subprocess using `.venv/sirius` (duckdb==1.4.3 + Sirius extension). Communicates JSON over stdin/stdout. Requires Sirius built and the `SIRIUS_ROOT` env var pointing to its root (defaults to `/home/cc/sirius` if unset). Runs are skipped gracefully if unavailable.
 
 ## Models Tested (llama.cpp, RTX 6000)
 

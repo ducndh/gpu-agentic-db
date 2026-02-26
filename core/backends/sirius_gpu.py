@@ -27,8 +27,8 @@ from pathlib import Path
 from core.backends.duckdb_cpu import QueryResult
 from core.timer import StageTimer
 
-# Path to Sirius build
-SIRIUS_ROOT = Path("/home/cc/sirius")
+# Path to Sirius build — override with SIRIUS_ROOT env var for portability
+SIRIUS_ROOT = Path(os.environ.get("SIRIUS_ROOT", "/home/cc/sirius"))
 SIRIUS_EXT = SIRIUS_ROOT / "build/release/extension/sirius/sirius.duckdb_extension"
 
 # Default GPU buffer sizes (leave headroom for LLM)
@@ -297,10 +297,14 @@ class SiriusGPUBackend:
     @staticmethod
     def _find_python() -> str:
         """Find the Python interpreter that has duckdb 1.4.3 for Sirius."""
-        # Priority: project venv > conda libcudf-env > current interpreter
+        # Priority: SIRIUS_PYTHON env var > project venv > micromamba env > current interpreter
+        # Resolve project root relative to this file so it works on any machine
+        _proj_root = Path(__file__).resolve().parent.parent.parent
+        _mamba_root = Path(os.environ.get("MAMBA_ROOT_PREFIX", str(Path.home() / "micromamba")))
         candidates = [
-            "/home/cc/gpu-agentic-db/.venv/sirius/bin/python",
-            "/home/cc/miniconda3/envs/libcudf-env/bin/python3",
+            os.environ.get("SIRIUS_PYTHON", ""),
+            str(_proj_root / ".venv/sirius/bin/python"),
+            str(_mamba_root / "envs/sirius-worker/bin/python"),
             sys.executable,
         ]
         for p in candidates:
