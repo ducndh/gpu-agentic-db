@@ -41,8 +41,15 @@ RESULTS_DIR  = PROJECT_ROOT / "results"
 VALIDATION_KEYS_FILE = RESULTS_DIR / "validation_keys.json"
 
 # Models available on L40S (48GB VRAM)
-# BF16 memory: 7B~15GB, 14B~29GB, 32B~65GB (use AWQ for 32B)
+# BF16 memory: 1.5B~3GB, 7B~15GB, 14B~29GB, 32B~65GB (use AWQ for 32B)
 MODEL_CONFIGS = [
+    {
+        "name": "qwen2.5-1.5b-bf16",
+        "hf_id": "Qwen/Qwen2.5-1.5B-Instruct",
+        "dtype": "auto",
+        "quantization": None,
+        "max_model_len": 16384,
+    },
     {
         "name": "qwen2.5-7b-bf16",
         "hf_id": "Qwen/Qwen2.5-7B-Instruct",
