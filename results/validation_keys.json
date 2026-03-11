@@ -1,32 +1,52 @@
 {
-  "q6_discount_revenue": {
-    "1": "61567694",
-    "5": "30798470",
-    "10": "61666215"
+  "discovery_revenue_1997": {
+    "1": "33049396",
+    "5": "16524644",
+    "10": "33043181"
   },
-  "q1_lineitem_summary": {
-    "1": "A",
-    "5": "A",
-    "10": "A"
+  "discovery_top_nations": {
+    "1": "IRAQ",
+    "5": "INDIA",
+    "10": "IRAQ"
   },
-  "q3_unshipped_revenue": {
-    "1": "4994400",
-    "5": "6629573",
-    "10": "37911232"
+  "multistep_top_customer_orders": {
+    "1": "5014790",
+    "5": "25860390",
+    "10": "58409539"
   },
-  "q5_europe_revenue": {
-    "1": "ROMANIA",
-    "5": "UNITED KINGDOM",
-    "10": "GERMANY"
+  "multistep_supplier_analysis": {
+    "1": "1992",
+    "5": "1992",
+    "10": "1992"
   },
-  "q16_supplier_count": {
-    "1": "Brand#45",
-    "5": "Brand#44",
-    "10": "Brand#12"
+  "ranked_suppliers_by_nation": {
+    "1": "5489",
+    "5": "32987",
+    "10": "24957"
+  },
+  "monthly_trend_analysis": {
+    "1": "1",
+    "5": "1",
+    "10": "1"
+  },
+  "exploratory_segment_analysis": {
+    "1": "BUILDING",
+    "5": "FURNITURE",
+    "10": "BUILDING"
   },
   "large_shipment_scan": {
-    "1": "2455558",
-    "5": "20499203",
-    "10": "45386470"
+    "1": "4121796",
+    "5": "21696931",
+    "10": "22702272"
+  },
+  "large_supplier_parts": {
+    "1": "Supplier#000007205",
+    "5": "Supplier#000026774",
+    "10": "Supplier#000031555"
+  },
+  "large_order_details": {
+    "1": "3043270",
+    "5": "17348610",
+    "10": "1263015"
   }
 }

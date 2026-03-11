@@ -4,19 +4,12 @@ ReAct (Reason + Act) agent loop with per-stage timing and retry-until-correct.
 The agent follows the standard ReAct pattern:
   Thought → Action (SQL) → Observation (result) → Thought → ... → Answer
 
-For each task, if a validation_key is provided, the agent's final answer is
-checked against it.  If incorrect, the agent is retried with a hint
-("Your previous answer was incorrect..."), up to max_retries times.
-
-This mimics a real agentic workflow where the system keeps trying until it
-produces a correct answer, not just until it stops generating.
-
 Stage timing per turn:
   sql_exec    - DB executes the SQL (includes GPU compute for Sirius)
-  fetch       - fetchall() copies results to Python (only non-zero for CPU backend)
+  fetch       - fetchall() copies results to Python
   serialize   - Format result table as markdown (CPU string work)
   tokenize    - Tokenize the formatted text (CPU tokenizer)
-  llm_prefill - LLM processes context with SQL result (estimated from usage)
+  llm_prefill - LLM processes context with SQL result
   llm_gen     - LLM generating SQL / reasoning / final answer (decode)
 
 data_path = fetch + serialize + tokenize = what GPU colocation would eliminate.
@@ -24,13 +17,20 @@ data_path = fetch + serialize + tokenize = what GPU colocation would eliminate.
 
 import re
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Protocol
 
 from tokenizers import Tokenizer
 
 from core.backends.duckdb_cpu import QueryResult
-from core.llm.llama_backend import LlamaBackend, LLMResponse
 from core.timer import RunRecord, StageTimer, TurnRecord
+
+
+# ── LLM Protocol ─────────────────────────────────────────────────────────────
+
+class LLMBackendProtocol(Protocol):
+    """Any LLM backend must implement this interface."""
+    def chat(self, messages: list[dict], prev_prompt_tokens: int = 0): ...
+
 
 # ── System prompt ─────────────────────────────────────────────────────────────
 
@@ -73,7 +73,7 @@ def format_result_as_markdown(columns: list[str], rows: list[tuple]) -> str:
     """Convert query result to a markdown table string."""
     if not rows:
         return "(empty result)"
-    MAX_ROWS = 100  # truncate to keep context manageable
+    MAX_ROWS = 100  # cap to keep context within model limits
     lines = []
     lines.append("| " + " | ".join(str(c) for c in columns) + " |")
     lines.append("|" + "|".join(" --- " for _ in columns) + "|")
@@ -106,29 +106,16 @@ class ReactAgent:
     """
     ReAct agent with per-stage timing and retry-until-correct.
 
-    Parameters
-    ----------
-    llm: LlamaBackend
-        Loaded LLM backend (call load() before using the agent).
-    db: DuckDBCPUBackend | SiriusGPUBackend
-        Database backend (must already be connected).
-    tokenizer: Tokenizer
-        HuggingFace tokenizer for measuring tokenization cost.
-    max_turns: int
-        Max (Thought+Action+Observation) cycles per attempt.
-    fallback_sql: str | None
-        Gold SQL used when LLM generates invalid SQL.
-    max_retries: int
-        If validation_key is provided and the answer is wrong, retry
-        the full conversation this many additional times.
+    Works with any LLM backend (LlamaBackend, VLLMBackend) and any SQL
+    backend (SQLBackend, DuckDBCPUBackend, SiriusGPUBackend).
     """
 
     def __init__(
         self,
-        llm: LlamaBackend,
+        llm,
         db,
         tokenizer: Tokenizer,
-        max_turns: int = 5,
+        max_turns: int = 10,
         fallback_sql: Optional[str] = None,
         max_retries: int = 2,
     ):
@@ -138,10 +125,6 @@ class ReactAgent:
         self.max_turns = max_turns
         self.fallback_sql = fallback_sql
         self.max_retries = max_retries
-
-    # ------------------------------------------------------------------
-    # Public interface
-    # ------------------------------------------------------------------
 
     def run(
         self,
@@ -153,10 +136,7 @@ class ReactAgent:
         scale_factor: int,
         validation_key: Optional[str] = None,
     ) -> RunRecord:
-        """
-        Run the agent (with retries if validation_key is provided).
-        All timing is accumulated in the returned RunRecord.
-        """
+        """Run the agent (with retries if validation_key is provided)."""
         record = RunRecord(
             task_name=task_name,
             backend=backend_name,
@@ -168,7 +148,6 @@ class ReactAgent:
         system_prompt = SYSTEM_PROMPT_TEMPLATE.format(schema=schema_hint)
 
         for attempt in range(1 + self.max_retries):
-            # Fresh conversation for each attempt
             messages = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user",   "content": question},
@@ -176,41 +155,33 @@ class ReactAgent:
 
             answer = self._run_attempt(messages, record, backend_name)
 
-            # Validate if key provided
             if validation_key is None:
                 record.final_answer = answer or "(no answer)"
-                record.answer_correct = True  # type: ignore[attr-defined]
+                record.answer_correct = True
                 break
 
             correct = validation_key.lower() in (answer or "").lower()
-            record.answer_correct = correct  # type: ignore[attr-defined]
+            record.answer_correct = correct
 
             if correct:
                 record.final_answer = answer or "(no answer)"
                 break
 
             if attempt < self.max_retries:
-                # Add a retry turn
-                record.n_retries = attempt + 1  # type: ignore[attr-defined]
-                # Note: retry turns add to the total timing (realistic)
+                record.n_retries = attempt + 1
                 messages = [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": RETRY_PROMPT.format(question=question)},
                 ]
             else:
-                # Exhausted retries
                 record.final_answer = answer or "(no answer after retries)"
 
         if not hasattr(record, "n_retries"):
-            record.n_retries = 0  # type: ignore[attr-defined]
+            record.n_retries = 0
         if not hasattr(record, "answer_correct"):
-            record.answer_correct = False  # type: ignore[attr-defined]
+            record.answer_correct = False
 
         return record
-
-    # ------------------------------------------------------------------
-    # Inner attempt loop
-    # ------------------------------------------------------------------
 
     def _run_attempt(
         self,
@@ -218,22 +189,15 @@ class ReactAgent:
         record: RunRecord,
         backend_name: str,
     ) -> Optional[str]:
-        """
-        Run one attempt (max_turns turns).  Appends turns to record.
-        Returns the final answer string if one was produced, else None.
-        """
-        prev_prompt_tokens = 0  # tracks KV cache state across turns
+        """Run one attempt (max_turns turns). Returns final answer or None."""
+        prev_prompt_tokens = 0
         for turn_idx in range(self.max_turns):
             turn = TurnRecord(turn_idx=len(record.turns))
 
             # ── LLM generates Thought + Action ────────────────────────────
-            llm_resp: LLMResponse = self.llm.chat(messages,
-                                                   prev_prompt_tokens=prev_prompt_tokens)
-            # llm_prefill: full-context estimate (correct for turn 0, overestimates later)
+            llm_resp = self.llm.chat(messages, prev_prompt_tokens=prev_prompt_tokens)
             turn.add("llm_prefill", llm_resp.prefill_ms,
                      n_prompt_tokens=llm_resp.n_prompt_tokens)
-            # llm_prefill_incr: KV-cache-aware estimate — only new tokens each turn.
-            # This is the right denominator for multi-turn colocation ceiling.
             turn.add("llm_prefill_incr", llm_resp.prefill_incr_ms,
                      n_new_prompt_tokens=llm_resp.n_new_prompt_tokens)
             turn.add("llm_gen", llm_resp.decode_ms,
@@ -269,7 +233,10 @@ class ReactAgent:
             if not qr.ok:
                 record.sql_failure_count += 1
                 if self.fallback_sql and not used_fallback:
-                    qr = self.db.execute(self.fallback_sql)
+                    try:
+                        qr = self.db.execute(self.fallback_sql)
+                    except Exception:
+                        pass
 
             if qr.ok:
                 record.sql_success_count += 1
